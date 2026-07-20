@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fs::File,
     io::{BufRead, BufReader},
 };
@@ -14,17 +14,20 @@ struct Station {
 fn main() {
     let f = File::open("measurements.txt").unwrap();
     let f = BufReader::new(f);
-    let mut station_stats = BTreeMap::<String, Station>::new();
+    let mut station_stats = HashMap::<String, Station>::new();
     for line in f.lines() {
         let line = line.unwrap();
         let (station, temp) = line.split_once(";").unwrap();
         let temp: f64 = temp.parse().unwrap();
-        let station_entry = station_stats.entry(station.to_string()).or_insert(Station {
-            min_temp: f64::MAX,
-            max_temp: f64::MIN,
-            sum: 0.0,
-            count: 0,
-        });
+        let station_entry = match station_stats.get_mut(station) {
+            Some(entry) => entry,
+            None => station_stats.entry(station.to_string()).or_insert(Station {
+                min_temp: f64::MAX,
+                max_temp: f64::MIN,
+                sum: 0.0,
+                count: 0,
+            }),
+        };
         station_entry.min_temp = station_entry.min_temp.min(temp);
         station_entry.max_temp = station_entry.max_temp.max(temp);
         station_entry.sum += temp;
@@ -32,6 +35,7 @@ fn main() {
     }
 
     print!("{{");
+    let station_stats = BTreeMap::from_iter(station_stats);
     let mut station_stats = station_stats.into_iter().peekable();
     while let Some((station_name, station_details)) = station_stats.next() {
         print!(
