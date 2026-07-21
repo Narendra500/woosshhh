@@ -14,14 +14,16 @@ struct Station {
 fn main() {
     let f = File::open("measurements.txt").unwrap();
     let f = BufReader::new(f);
-    let mut station_stats = HashMap::<String, Station>::new();
-    for line in f.lines() {
+    let mut station_stats = HashMap::<Vec<u8>, Station>::new();
+    for line in f.split(b'\n') {
         let line = line.unwrap();
-        let (station, temp) = line.split_once(";").unwrap();
-        let temp: f64 = temp.parse().unwrap();
+        let mut fields = line.rsplitn(2, |c| *c == b';');
+        let temp = fields.next().unwrap();
+        let station = fields.next().unwrap();
+        let temp: f64 = unsafe { std::str::from_utf8_unchecked(temp).parse().unwrap() };
         let station_entry = match station_stats.get_mut(station) {
             Some(entry) => entry,
-            None => station_stats.entry(station.to_string()).or_insert(Station {
+            None => station_stats.entry(station.to_vec()).or_insert(Station {
                 min_temp: f64::MAX,
                 max_temp: f64::MIN,
                 sum: 0.0,
@@ -35,7 +37,11 @@ fn main() {
     }
 
     print!("{{");
-    let station_stats = BTreeMap::from_iter(station_stats);
+    let station_stats = BTreeMap::from_iter(
+        station_stats
+            .into_iter()
+            .map(|(k, v)| (unsafe { String::from_utf8_unchecked(k) }, v)),
+    );
     let mut station_stats = station_stats.into_iter().peekable();
     while let Some((station_name, station_details)) = station_stats.next() {
         print!(
