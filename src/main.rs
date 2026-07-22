@@ -1,7 +1,8 @@
 use std::{
     collections::{BTreeMap, HashMap},
     fs::File,
-    io::{BufRead, BufReader},
+    io::{self},
+    os::fd::AsRawFd,
 };
 
 struct Station {
@@ -13,10 +14,12 @@ struct Station {
 
 fn main() {
     let f = File::open("measurements.txt").unwrap();
-    let f = BufReader::new(f);
+    let map = mmap(&f);
     let mut station_stats = HashMap::<Vec<u8>, Station>::new();
-    for line in f.split(b'\n') {
-        let line = line.unwrap();
+    for line in map.split(|c| *c == b'\n') {
+        if line.is_empty() {
+            break;
+        }
         let mut fields = line.rsplitn(2, |c| *c == b';');
         let temp = fields.next().unwrap();
         let station = fields.next().unwrap();
@@ -55,4 +58,27 @@ fn main() {
         }
     }
     print!("}}");
+}
+
+fn mmap(f: &File) -> &'_ [u8] {
+    let len = f.metadata().unwrap().len();
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len as libc::size_t,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            f.as_raw_fd(),
+            0,
+        )
+    };
+
+    if ptr == libc::MAP_FAILED {
+        panic!("{:?}", io::Error::last_os_error());
+    } else {
+        if unsafe { libc::madvise(ptr, len as libc::size_t, libc::MADV_SEQUENTIAL) } != 0 {
+            panic!("{:?}", io::Error::last_os_error());
+        }
+        unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize) }
+    }
 }
