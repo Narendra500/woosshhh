@@ -1,14 +1,16 @@
+use core::panic;
 use std::{
     collections::{BTreeMap, HashMap},
+    ffi::{c_int, c_void},
     fs::File,
     io::{self},
     os::fd::AsRawFd,
 };
 
 struct Station {
-    min_temp: f64,
-    max_temp: f64,
-    sum: f64,
+    min_temp: i16,
+    max_temp: i16,
+    sum: i64,
     count: usize,
 }
 
@@ -16,26 +18,34 @@ fn main() {
     let f = File::open("measurements.txt").unwrap();
     let map = mmap(&f);
     let mut station_stats = HashMap::<Vec<u8>, Station>::new();
-    for line in map.split(|c| *c == b'\n') {
-        if line.is_empty() {
+    let mut at = 0;
+    loop {
+        let rest = &map[at..];
+        if rest.is_empty() {
             break;
         }
-        let mut fields = line.rsplitn(2, |c| *c == b';');
-        let temp = fields.next().unwrap();
-        let station = fields.next().unwrap();
-        let temp: f64 = unsafe { std::str::from_utf8_unchecked(temp).parse().unwrap() };
+
+        let delimiter =
+            unsafe { libc::memchr(rest.as_ptr() as *const c_void, b';' as c_int, rest.len()) };
+        let station_len = unsafe { (delimiter as *const u8).offset_from(rest.as_ptr()) } as usize;
+        let station = &rest[..station_len];
+        at += station_len + 1;
+
+        let (t, bytes_read) = parse_temperature(&map[at..]);
+        at += bytes_read;
+
         let station_entry = match station_stats.get_mut(station) {
             Some(entry) => entry,
             None => station_stats.entry(station.to_vec()).or_insert(Station {
-                min_temp: f64::MAX,
-                max_temp: f64::MIN,
-                sum: 0.0,
+                min_temp: i16::MAX,
+                max_temp: i16::MIN,
+                sum: 0,
                 count: 0,
             }),
         };
-        station_entry.min_temp = station_entry.min_temp.min(temp);
-        station_entry.max_temp = station_entry.max_temp.max(temp);
-        station_entry.sum += temp;
+        station_entry.min_temp = station_entry.min_temp.min(t);
+        station_entry.max_temp = station_entry.max_temp.max(t);
+        station_entry.sum += i64::from(t);
         station_entry.count += 1;
     }
 
@@ -49,15 +59,43 @@ fn main() {
     while let Some((station_name, station_details)) = station_stats.next() {
         print!(
             "{station_name}={:.1}/{:.1}/{:.1}",
-            station_details.min_temp,
-            station_details.sum / (station_details.count as f64),
-            station_details.max_temp
+            station_details.min_temp as f64 / 10.,
+            (station_details.sum as f64 / 10.) / station_details.count as f64,
+            station_details.max_temp as f64 / 10.
         );
         if station_stats.peek().is_some() {
             print!(", ");
         }
     }
     print!("}}");
+}
+
+fn parse_temperature(bytes: &[u8]) -> (i16, usize) {
+    let mut ptr = 0;
+    let neg = if bytes[0] == b'-' {
+        ptr += 1;
+        true
+    } else {
+        false
+    };
+
+    let mut temp: i16 = (bytes[ptr] - b'0') as i16;
+    ptr += 1;
+
+    if bytes[ptr] != b'.' {
+        temp = temp * 10 + (bytes[ptr] - b'0') as i16;
+        ptr += 1;
+    }
+    ptr += 1;
+
+    temp = temp * 10 + (bytes[ptr] - b'0') as i16;
+    ptr += 2;
+
+    if neg {
+        temp = -temp;
+    }
+
+    (temp, ptr)
 }
 
 fn mmap(f: &File) -> &'_ [u8] {
