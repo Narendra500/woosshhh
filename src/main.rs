@@ -1,8 +1,8 @@
-use core::panic;
 use std::{
     collections::{BTreeMap, HashMap},
     ffi::{c_int, c_void},
     fs::File,
+    hash::{BuildHasher, Hasher},
     io::{self},
     os::fd::AsRawFd,
 };
@@ -14,10 +14,38 @@ struct Station {
     count: usize,
 }
 
+struct HasherBuilder;
+struct MyHasher(u64);
+
+impl BuildHasher for HasherBuilder {
+    type Hasher = MyHasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        MyHasher(0xcbf29ce484222325)
+    }
+}
+
+impl Hasher for MyHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let (chunks, remainder) = bytes.as_chunks::<8>();
+        let mut last = [1u8; 8];
+        (last[..remainder.len()]).copy_from_slice(remainder);
+        for &chunk in chunks.iter().chain(std::iter::once(&last)) {
+            let mixed = self.0 as i128 * (i64::from_ne_bytes(chunk) as i128 * -7046029254386353131);
+            self.0 = (mixed >> 64) as u64 ^ mixed as u64;
+        }
+    }
+}
+
 fn main() {
     let f = File::open("measurements.txt").unwrap();
     let map = mmap(&f);
-    let mut station_stats = HashMap::<Vec<u8>, Station>::new();
+    let mut station_stats =
+        HashMap::<Vec<u8>, Station, _>::with_capacity_and_hasher(10_0000, HasherBuilder);
     let mut at = 0;
     loop {
         let rest = &map[at..];
