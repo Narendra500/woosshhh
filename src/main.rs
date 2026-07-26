@@ -1,3 +1,4 @@
+#![feature(hasher_prefixfree_extras)]
 use std::{
     borrow::Borrow,
     collections::{BTreeMap, HashMap},
@@ -30,6 +31,8 @@ impl Hasher for MyHasher {
     fn finish(&self) -> u64 {
         self.0
     }
+
+    fn write_length_prefix(&mut self, _len: usize) {}
 
     fn write(&mut self, bytes: &[u8]) {
         let (chunks, remainder) = bytes.as_chunks::<8>();
@@ -121,7 +124,7 @@ fn main() {
     let f = File::open("measurements.txt").unwrap();
     let map = mmap(&f);
     let mut station_stats =
-        HashMap::<InlinedVec, Station, _>::with_capacity_and_hasher(10_0000, HasherBuilder);
+        HashMap::<InlinedVec, Station, _>::with_capacity_and_hasher(512, HasherBuilder);
     let mut at = 0;
     loop {
         let rest = &map[at..];
