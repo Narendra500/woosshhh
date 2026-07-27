@@ -16,6 +16,9 @@ struct Station {
     count: usize,
 }
 
+const HASH_K: u64 = 0x29075a5bfdefefd6;
+const HASH_SEED: u64 = 0xb439cb55ce7d4c61;
+
 struct HasherBuilder;
 struct MyHasher(u64);
 
@@ -23,25 +26,34 @@ impl BuildHasher for HasherBuilder {
     type Hasher = MyHasher;
 
     fn build_hasher(&self) -> Self::Hasher {
-        MyHasher(0xcbf29ce484222325)
+        MyHasher(0xD5C937D8175A6BF4)
     }
 }
 
 impl Hasher for MyHasher {
     fn finish(&self) -> u64 {
-        self.0
+        self.0.rotate_left(26)
     }
 
     fn write_length_prefix(&mut self, _len: usize) {}
 
     fn write(&mut self, bytes: &[u8]) {
-        let (chunks, remainder) = bytes.as_chunks::<8>();
-        let mut last = [1u8; 8];
-        (last[..remainder.len()]).copy_from_slice(remainder);
-        for &chunk in chunks.iter().chain(std::iter::once(&last)) {
-            let mixed = self.0 as i128 * (i64::from_ne_bytes(chunk) as i128 * -7046029254386353131);
-            self.0 = (mixed >> 64) as u64 ^ mixed as u64;
+        let len = bytes.len();
+        let mut acc = HASH_SEED;
+
+        match len {
+            0..4 => {
+                let low = bytes[0];
+                let mid = bytes[len / 2];
+                let high = bytes[len - 1];
+                acc ^= (low as u64) | ((mid as u64) << 8) | ((high as u64) << 16);
+            }
+            4.. => {
+                acc ^= u32::from_ne_bytes(bytes[0..4].try_into().unwrap()) as u64;
+            }
         }
+
+        self.0 = self.0.wrapping_add(acc).wrapping_mul(HASH_K);
     }
 }
 
@@ -179,7 +191,9 @@ fn main() {
     print!("}}");
 }
 
+#[inline(never)]
 fn parse_temperature(bytes: &[u8]) -> (i16, usize) {
+    assert!(bytes.len() >= 3);
     let mut ptr = 0;
     let neg = if bytes[0] == b'-' {
         ptr += 1;
