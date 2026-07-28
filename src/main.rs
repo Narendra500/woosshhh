@@ -1,12 +1,13 @@
 #![feature(hasher_prefixfree_extras)]
+#![feature(portable_simd)]
 use std::{
     borrow::Borrow,
     collections::{BTreeMap, HashMap, hash_map::Entry},
-    ffi::{c_int, c_void},
     fs::File,
     hash::{BuildHasher, Hash, Hasher},
     io::{self},
     os::fd::AsRawFd,
+    simd::{Simd, cmp::SimdPartialEq},
 };
 
 struct Station {
@@ -49,7 +50,9 @@ impl Hasher for MyHasher {
                 acc ^= (low as u64) | ((mid as u64) << 8) | ((high as u64) << 16);
             }
             4.. => {
-                acc ^= u32::from_ne_bytes(bytes[0..4].try_into().unwrap()) as u64;
+                let first = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as u64;
+                let last = u32::from_le_bytes(bytes[len - 4..].try_into().unwrap()) as u64;
+                acc ^= first ^ (last << 32) ^ (len as u64);
             }
         }
 
@@ -76,6 +79,7 @@ impl InlinedVec {
         } else {
             std::hint::cold_path();
             let (ptr, len, _cap) = bytes.to_vec().into_raw_parts();
+            let len = len.to_le();
             Self { heap: (ptr, len) }
         }
     }
@@ -85,7 +89,8 @@ impl Drop for InlinedVec {
     fn drop(&mut self) {
         unsafe {
             if self.inlined[LAST] == 0x00 {
-                let _ = Vec::from_raw_parts(self.heap.0, self.heap.1, self.heap.1);
+                let len = usize::from_le(self.heap.1);
+                let _ = Vec::from_raw_parts(self.heap.0, len, len);
             }
         }
     }
@@ -121,7 +126,7 @@ impl AsRef<[u8]> for InlinedVec {
                 std::slice::from_raw_parts(self.inlined.as_ptr(), len)
             } else {
                 std::hint::cold_path();
-                let len = self.heap.1;
+                let len = usize::from_le(self.heap.1);
                 let ptr = self.heap.0;
                 std::slice::from_raw_parts(ptr, len)
             }
@@ -149,11 +154,11 @@ fn main() {
         for _ in 0..thread_count {
             let start = at;
             let end = (at + chunk_size).min(map.len());
-            let newline_offset = next_newline(&map[end..]);
             let end = if end == map.len() {
                 std::hint::cold_path();
                 end
             } else {
+                let newline_offset = next_newline(&map[end..]).unwrap();
                 end + newline_offset + 1
             };
             let map = &map[start..end];
@@ -205,16 +210,40 @@ fn main() {
     print!("}}");
 }
 
-fn next_newline(bytes: &[u8]) -> usize {
-    if bytes.is_empty() {
-        std::hint::cold_path();
-        return 0;
+fn next_newline(mut buf: &[u8]) -> Option<usize> {
+    const LANES: usize = 32;
+    const SPLAT: Simd<u8, LANES> = Simd::splat(b'\n');
+
+    let mut i = 0;
+    while let Some((chunk, rest)) = buf.split_first_chunk::<LANES>() {
+        let bytes = Simd::<u8, LANES>::from_array(*chunk);
+        let newline_at = bytes.simd_eq(SPLAT).first_set().map(|set| set + i);
+        if newline_at.is_some() {
+            return newline_at;
+        }
+        i += LANES;
+        buf = rest;
     }
-    let newline =
-        // SAFETY: bytes is a valid pointer to map and \n is promised in every line in README.
-        unsafe { libc::memchr(bytes.as_ptr() as *const c_void, b'\n' as c_int, bytes.len()) };
-    let offset = unsafe { (newline as *const u8).offset_from(bytes.as_ptr()) } as usize;
-    offset
+    let bytes = Simd::<u8, LANES>::load_or_default(buf);
+    bytes.simd_eq(SPLAT).first_set().map(|set| set + i)
+}
+
+fn next_delim(mut buf: &[u8]) -> usize {
+    const LANES: usize = 32;
+    const SPLAT: Simd<u8, LANES> = Simd::splat(b';');
+
+    let mut i = 0;
+    while let Some((chunk, rest)) = buf.split_first_chunk::<LANES>() {
+        let bytes = Simd::<u8, LANES>::from_array(*chunk);
+        let newline_at = bytes.simd_eq(SPLAT).first_set().map(|set| set + i);
+        if newline_at.is_some() {
+            return newline_at.unwrap();
+        }
+        i += LANES;
+        buf = rest;
+    }
+    let bytes = Simd::<u8, LANES>::load_or_default(buf);
+    bytes.simd_eq(SPLAT).first_set().unwrap()
 }
 
 fn compute_shard(map: &[u8]) -> HashMap<InlinedVec, Station, HasherBuilder> {
@@ -227,12 +256,9 @@ fn compute_shard(map: &[u8]) -> HashMap<InlinedVec, Station, HasherBuilder> {
             break;
         }
 
-        let delimiter =
-            // SAFETY: rest is a valid pointer to map and ; is promised in every line in README.
-            unsafe { libc::memchr(rest.as_ptr() as *const c_void, b';' as c_int, rest.len()) };
-        let station_len = unsafe { (delimiter as *const u8).offset_from(rest.as_ptr()) } as usize;
-        let station = &rest[..station_len];
-        at += station_len + 1;
+        let delimiter_at = next_delim(rest);
+        let station = &rest[..delimiter_at];
+        at += delimiter_at + 1;
 
         let (t, bytes_read) = parse_temperature(&map[at..]);
         at += bytes_read;
