@@ -1,7 +1,7 @@
 #![feature(hasher_prefixfree_extras)]
 use std::{
     borrow::Borrow,
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, hash_map::Entry},
     ffi::{c_int, c_void},
     fs::File,
     hash::{BuildHasher, Hash, Hasher},
@@ -26,7 +26,7 @@ impl BuildHasher for HasherBuilder {
     type Hasher = MyHasher;
 
     fn build_hasher(&self) -> Self::Hasher {
-        MyHasher(0xD5C937D8175A6BF4)
+        MyHasher(0xd5c937d8175a6bf4)
     }
 }
 
@@ -85,7 +85,7 @@ impl Drop for InlinedVec {
     fn drop(&mut self) {
         unsafe {
             if self.inlined[LAST] == 0x00 {
-                let _ = self.heap.0;
+                let _ = Vec::from_raw_parts(self.heap.0, self.heap.1, self.heap.1);
             }
         }
     }
@@ -103,6 +103,9 @@ impl PartialEq for InlinedVec {
 }
 
 impl Eq for InlinedVec {}
+
+// SAFETY: Just a Vec<str> which is fine across thread boundries.
+unsafe impl Send for InlinedVec {}
 
 impl Hash for InlinedVec {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -134,7 +137,87 @@ impl Borrow<[u8]> for InlinedVec {
 
 fn main() {
     let f = File::open("measurements.txt").unwrap();
-    let map = mmap(&f);
+    let mut station_stats =
+        HashMap::<InlinedVec, Station, _>::with_capacity_and_hasher(512, HasherBuilder);
+    std::thread::scope(|scope| {
+        let map = mmap(&f);
+        let thread_count = std::thread::available_parallelism().unwrap().get();
+        let (tx, rx) = std::sync::mpsc::sync_channel(thread_count);
+        let chunk_size = map.len() / thread_count;
+        let mut at = 0;
+
+        for _ in 0..thread_count {
+            let start = at;
+            let end = (at + chunk_size).min(map.len());
+            let newline_offset = next_newline(&map[end..]);
+            let end = if end == map.len() {
+                std::hint::cold_path();
+                end
+            } else {
+                end + newline_offset + 1
+            };
+            let map = &map[start..end];
+            at = end;
+            let tx = tx.clone();
+            scope.spawn(move || {
+                let _ = tx.send(compute_shard(map));
+            });
+        }
+
+        drop(tx);
+        for stats in rx {
+            for (k, v) in stats {
+                match station_stats.entry(k) {
+                    Entry::Vacant(none) => {
+                        none.insert(v);
+                    }
+                    Entry::Occupied(some) => {
+                        let stat = some.into_mut();
+                        stat.min_temp = stat.min_temp.min(v.min_temp);
+                        stat.max_temp = stat.max_temp.max(v.max_temp);
+                        stat.sum += v.sum;
+                        stat.count += v.count;
+                    }
+                }
+            }
+        }
+    });
+
+    print!("{{");
+    let station_stats = BTreeMap::from_iter(
+        station_stats
+            .iter()
+            // SAFETY: station names are valid UTF-8 as per README.
+            .map(|(k, v)| (unsafe { str::from_utf8_unchecked(k.as_ref()) }, v)),
+    );
+    let mut station_stats = station_stats.into_iter().peekable();
+    while let Some((station_name, station_details)) = station_stats.next() {
+        print!(
+            "{station_name}={:.1}/{:.1}/{:.1}",
+            station_details.min_temp as f64 / 10.,
+            (station_details.sum as f64 / 10.) / station_details.count as f64,
+            station_details.max_temp as f64 / 10.
+        );
+        if station_stats.peek().is_some() {
+            print!(", ");
+        }
+    }
+    print!("}}");
+}
+
+fn next_newline(bytes: &[u8]) -> usize {
+    if bytes.is_empty() {
+        std::hint::cold_path();
+        return 0;
+    }
+    let newline =
+        // SAFETY: bytes is a valid pointer to map and \n is promised in every line in README.
+        unsafe { libc::memchr(bytes.as_ptr() as *const c_void, b'\n' as c_int, bytes.len()) };
+    let offset = unsafe { (newline as *const u8).offset_from(bytes.as_ptr()) } as usize;
+    offset
+}
+
+fn compute_shard(map: &[u8]) -> HashMap<InlinedVec, Station, HasherBuilder> {
     let mut station_stats =
         HashMap::<InlinedVec, Station, _>::with_capacity_and_hasher(512, HasherBuilder);
     let mut at = 0;
@@ -145,6 +228,7 @@ fn main() {
         }
 
         let delimiter =
+            // SAFETY: rest is a valid pointer to map and ; is promised in every line in README.
             unsafe { libc::memchr(rest.as_ptr() as *const c_void, b';' as c_int, rest.len()) };
         let station_len = unsafe { (delimiter as *const u8).offset_from(rest.as_ptr()) } as usize;
         let station = &rest[..station_len];
@@ -170,28 +254,9 @@ fn main() {
         station_entry.count += 1;
     }
 
-    print!("{{");
-    let station_stats = BTreeMap::from_iter(
-        station_stats
-            .iter()
-            .map(|(k, v)| (unsafe { str::from_utf8_unchecked(k.as_ref()) }, v)),
-    );
-    let mut station_stats = station_stats.into_iter().peekable();
-    while let Some((station_name, station_details)) = station_stats.next() {
-        print!(
-            "{station_name}={:.1}/{:.1}/{:.1}",
-            station_details.min_temp as f64 / 10.,
-            (station_details.sum as f64 / 10.) / station_details.count as f64,
-            station_details.max_temp as f64 / 10.
-        );
-        if station_stats.peek().is_some() {
-            print!(", ");
-        }
-    }
-    print!("}}");
+    station_stats
 }
 
-#[inline(never)]
 fn parse_temperature(bytes: &[u8]) -> (i16, usize) {
     assert!(bytes.len() >= 3);
     let mut ptr = 0;
@@ -212,7 +277,8 @@ fn parse_temperature(bytes: &[u8]) -> (i16, usize) {
     ptr += 1;
 
     temp = temp * 10 + (bytes[ptr] - b'0') as i16;
-    ptr += 2;
+    ptr += 1;
+    ptr += if ptr == bytes.len() { 0 } else { 1 };
 
     if neg {
         temp = -temp;
